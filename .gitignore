@@ -1,0 +1,8 @@
+.vscode/
+
+*.keystore
+*.jks
+*.apk
+*.idsig
+
+__pycache__/
