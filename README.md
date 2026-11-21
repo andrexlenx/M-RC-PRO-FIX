@@ -10,9 +10,14 @@ This repository contains a small script that fixes that bug in **your own copy**
 
 When you press START, the app checks for three permissions that were added in Android 13 (`READ_MEDIA_IMAGES`, `READ_MEDIA_VIDEO`, `READ_MEDIA_AUDIO`). The developer forgot to declare them in the app's manifest. Android silently denies any permission that an app doesn't declare, so the permission dialog flashes and closes, the app logs `ActMain: ERROR2`, and nothing happens. The same check also blocks the photo and video buttons.
 
+A second bug breaks the **share** button in the app's gallery on Android 10 and newer: the app tries to register the file with Android's media database in an old way that modern Android rejects ("Mutation of _data is not allowed"), so nothing happens.
+
 ## The fix
 
-The script changes a single instruction in the app's code: on Android 13+ the storage check now reports "granted". This is safe because the app saves its photos and videos in its own folder, which needs no storage permission on modern Android.
+The script makes two changes to the app's code:
+
+1. **START button:** on Android 13+ the storage check now reports "granted". This is safe because the app saves its photos and videos in its own folder, which needs no storage permission on modern Android.
+2. **Share button:** sharing a photo or video now registers it with Android the modern way (a copy is saved to `Pictures/` or `Movies/`) and passes that copy to the app you share with.
 
 The app's connection to the drone, its video and its controls are not modified.
 
@@ -75,24 +80,24 @@ Connect the phone to the drone's Wi-Fi, open M RC PRO and press START. Allow the
 ## Known limitations
 
 - **The Google Maps minimap is blank.** The app's Maps key is tied to the developer's signature, which a re-signed app can't have. Video, photos, recording and flight controls don't depend on it.
-- **The share button in the in-app gallery doesn't work.** This is a separate bug in the original app (it uses a method modern Android rejects), not something caused by this patch.
+- **Sharing saves an extra copy.** Each time you share a photo or video, a copy is added to `Pictures/` or `Movies/`, next to the copy the app already makes automatically (see below). Sharing the same file twice creates two copies.
 - **No automatic updates.** The Play Store won't update the fixed app. If a new official version appears, check whether it fixes the bug; if it doesn't, this script will need updating for it.
 
 ## Getting your photos and videos
 
-Photos and videos taken from the app are saved on the phone in:
+The app keeps the originals of the photos and videos you take in its own folder, which is what its built-in gallery shows:
 
 ```
 Android/data/com.logic.mrcpro/files/Pictures/
 ```
 
-They show up in the app's own gallery, but not in the phone's Gallery app, and they are **deleted if you uninstall the app**. To copy them to a PC:
+This folder is **deleted if you uninstall the app**.
+
+The app also saves a copy of each photo in `Pictures/` (named like `2026112119172202.jpg.png`) and of each video in `Movies/`. Those copies appear in the phone's Gallery app. To copy the originals to a PC:
 
 ```sh
 adb pull /sdcard/Android/data/com.logic.mrcpro/files/Pictures/ drone-media
 ```
-
-On many phones the folder is also visible when you browse the phone from a PC over USB (file transfer mode).
 
 ## Troubleshooting
 
@@ -106,6 +111,10 @@ On many phones the folder is also visible when you browse the phone from a PC ov
 
 ## How it works (technical)
 
+All changes are made in place in `classes.dex`, with the same length, using only method, type and string references that already exist in the app, so nothing else in the file moves.
+
+### 1. START button
+
 The patched method is `com.activity.ActBasic.checkWriteExternalPermission(Z)Z`:
 
 ```smali
@@ -118,7 +127,25 @@ if-eqz v0, :return_true               # patched to: goto :return_true
 ...                                   # requested undeclared READ_MEDIA_* permissions -> always denied
 ```
 
-One 4-byte change at `classes.dex` offset `0x20081A` (`38000b00` → `280b0000`, i.e. `if-eqz v0, +0xb` → `goto +0xb; nop`). The script then fixes the DEX header checksums, rebuilds the APK without the old signature, aligns it with `zipalign`, and signs it with `apksigner`.
+One 4-byte change at `classes.dex` offset `0x20081A` (`38000b00` → `280b0000`, i.e. `if-eqz v0, +0xb` → `goto +0xb; nop`).
+
+### 2. Share button
+
+The share code (`lgUtil.ShareImages`/`ShareVideos` and `ActPhoto.onShareBtn`) gets a `content://` URI from `com.lgUtil.lgUtil.getImageContentUri` / `getVideoContentUri(Context, String path, Uri collection)`. The original methods look the file up with `_data=?` and, if it's not found, insert a row with `_data` = the app-private path. Android 10+ rejects that. Their bodies (offsets `0x315420` and `0x3155B0`) are replaced with the equivalent of:
+
+```java
+ContentValues cv = new ContentValues();
+cv.put("_display_name", new File(path).getName());       // MIME type is inferred from the extension
+Uri uri = ctx.getContentResolver().insert(collection, cv); // lands in Pictures/ or Movies/
+if (uri != null) MediaUtils.copyFile(path, ctx.getContentResolver().openOutputStream(uri));
+return uri;
+```
+
+That's 37 code units; the rest of each original method (108 and 110 units) is filled with `nop`. `MediaUtils.copyFile` is the app's own helper, already used by its `saveImageToGallery`.
+
+### Packaging
+
+The script then fixes the DEX header checksums, rebuilds the APK without the old signature, aligns it with `zipalign`, and signs it with `apksigner`.
 
 ## License
 

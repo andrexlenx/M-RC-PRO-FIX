@@ -9,9 +9,13 @@ permissions are not declared in its manifest. Android silently denies
 undeclared permissions, so START does nothing (logcat: "ActMain: ERROR2").
 
 The fix: ActBasic.checkWriteExternalPermission() reports "granted" on
-Android 13+. That is safe because since Android 11 an app can save its own
-photos/videos in the shared Pictures/ folder without any storage permission.
-Android 12 and older keep the original behaviour.
+Android 13+. That is safe because the app saves its photos/videos in its own
+folder, which needs no storage permission. Android 12 and older keep the
+original behaviour.
+
+It also fixes the gallery Share button (Android 10+), which failed because the
+app registered files with MediaStore using the rejected "_data" column: shared
+files are now copied into MediaStore the modern way and that URI is shared.
 
 Usage:
     python patch_mrcpro.py <original.apk> [-o mrcpro-fixed.apk]
@@ -34,10 +38,52 @@ from pathlib import Path
 # Supported build: M RC PRO 25.10.31 (versionCode 113)
 SUPPORTED_DEX_SHA256 = "7db6316fbb3a32202d436cd402d6412a6b962b04d5a24b1a21238023c14a7449"
 
-# ActBasic.checkWriteExternalPermission(Z)Z, instruction 0x000b:
-#   if-eqz v0, +0x0b  ->  goto +0x0b ; nop   (always "return true" on SDK >= 33)
+# New body for lgUtil.getImageContentUri / getVideoContentUri
+# (Context v8, String path v9, Uri collection v10) -> Uri.
+# The original inserted a MediaStore row with "_data" = app-private path, which
+# Android 10+ rejects ("Mutation of _data is not allowed"), so sharing failed.
+# Replacement (only existing method/type/string ids are used):
+#   ContentValues cv = new ContentValues();
+#   cv.put("_display_name", new File(path).getName());
+#   Uri uri = ctx.getContentResolver().insert(collection, cv);
+#   if (uri != null) MediaUtils.copyFile(path, resolver.openOutputStream(uri));
+#   return uri;
+SHARE_URI_BODY = bytes.fromhex(
+    "22006500"        # new-instance v0, Landroid/content/ContentValues;
+    "701030020000"    # invoke-direct {v0}, ContentValues.<init>()V
+    "2201bd16"        # new-instance v1, Ljava/io/File;
+    "7020aba59100"    # invoke-direct {v1, v9}, File.<init>(String)V
+    "6e10b8a50100"    # invoke-virtual {v1}, File.getName()String
+    "0c01"            # move-result-object v1
+    "1a02ba4f"        # const-string v2, "_display_name"
+    "6e3031022001"    # invoke-virtual {v0, v2, v1}, ContentValues.put(String,String)V
+    "6e1045020800"    # invoke-virtual {v8}, Context.getContentResolver()
+    "0c02"            # move-result-object v2
+    "6e302502a200"    # invoke-virtual {v2, v10, v0}, ContentResolver.insert(Uri,ContentValues)Uri
+    "0c00"            # move-result-object v0
+    "38000900"        # if-eqz v0, +9 (-> return-object v0)
+    "6e202b020200"    # invoke-virtual {v2, v0}, ContentResolver.openOutputStream(Uri)
+    "0c01"            # move-result-object v1
+    "7120e09a1900"    # invoke-static {v9, v1}, MediaUtils.copyFile(String,OutputStream)Z
+    "1100"            # return-object v0
+)
+
+
+def method_body(body, insns_units):
+    """Pad a new method body with nops to the original insns_size."""
+    assert len(body) % 2 == 0 and len(body) <= insns_units * 2
+    return body + b"\x00" * (insns_units * 2 - len(body))
+
+
+# (offset, expected original bytes at offset, replacement bytes)
 PATCHES = [
+    # 1. START button: ActBasic.checkWriteExternalPermission(Z)Z, insn 0x000b
+    #    if-eqz v0, +0x0b -> goto +0x0b ; nop   (always "return true" on SDK >= 33)
     (0x20081A, bytes.fromhex("38000b00"), bytes.fromhex("280b0000")),
+    # 2. Gallery share (photos): lgUtil.getImageContentUri, insns_size 108
+    (0x315420, bytes.fromhex("120038086a00"), method_body(SHARE_URI_BODY, 108)),
+    # 3. Gallery share (videos): lgUtil.getVideoContentUri, insns_size 110
+    (0x3155B0, bytes.fromhex("120038086c00"), method_body(SHARE_URI_BODY, 110)),
 ]
 
 DEFAULT_KS_PASS = "android"
@@ -118,7 +164,7 @@ def patch_dex(dex: bytearray):
     for off, old, new in PATCHES:
         if dex[off:off + len(old)] != old:
             fail(f"unexpected bytes at 0x{off:x}")
-        dex[off:off + len(new)] = new
+        dex[off:off + len(new)] = new  # same length: nothing else in the file moves
     # Fix DEX header: SHA-1 of [32:] at offset 12, Adler-32 of [12:] at offset 8
     dex[12:32] = hashlib.sha1(dex[32:]).digest()
     struct.pack_into("<I", dex, 8, zlib.adler32(bytes(dex[12:])) & 0xFFFFFFFF)
