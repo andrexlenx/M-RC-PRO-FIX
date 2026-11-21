@@ -1,0 +1,185 @@
+#!/usr/bin/env python3
+"""
+M-RC-PRO-FIX - patches the M RC PRO app (com.logic.mrcpro) so the START button
+works on Android 13+.
+
+The bug: on Android 13+ the app requires READ_MEDIA_IMAGES/VIDEO/AUDIO before
+opening the drone dashboard (and before taking photos/videos), but those
+permissions are not declared in its manifest. Android silently denies
+undeclared permissions, so START does nothing (logcat: "ActMain: ERROR2").
+
+The fix: ActBasic.checkWriteExternalPermission() reports "granted" on
+Android 13+. That is safe because since Android 11 an app can save its own
+photos/videos in the shared Pictures/ folder without any storage permission.
+Android 12 and older keep the original behaviour.
+
+Usage:
+    python patch_mrcpro.py <original.apk> [-o mrcpro-fixed.apk]
+
+Requirements: Python 3.8+, Java (keytool), Android SDK build-tools
+(zipalign + apksigner).
+"""
+import argparse
+import hashlib
+import os
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+import zipfile
+import zlib
+from pathlib import Path
+
+# Supported build: M RC PRO 25.10.31 (versionCode 113)
+SUPPORTED_DEX_SHA256 = "7db6316fbb3a32202d436cd402d6412a6b962b04d5a24b1a21238023c14a7449"
+
+# ActBasic.checkWriteExternalPermission(Z)Z, instruction 0x000b:
+#   if-eqz v0, +0x0b  ->  goto +0x0b ; nop   (always "return true" on SDK >= 33)
+PATCHES = [
+    (0x20081A, bytes.fromhex("38000b00"), bytes.fromhex("280b0000")),
+]
+
+DEFAULT_KS_PASS = "android"
+KEY_ALIAS = "mrcprofix"
+
+
+def fail(msg):
+    sys.exit(f"ERROR: {msg}")
+
+
+def find_build_tools():
+    candidates = []
+    for var in ("ANDROID_HOME", "ANDROID_SDK_ROOT"):
+        if os.environ.get(var):
+            candidates.append(Path(os.environ[var]))
+    if os.environ.get("LOCALAPPDATA"):
+        candidates.append(Path(os.environ["LOCALAPPDATA"]) / "Android" / "Sdk")
+    candidates += [Path.home() / "Library/Android/sdk", Path.home() / "Android/Sdk"]
+
+    exe = ".exe" if os.name == "nt" else ""
+    signer = "apksigner.bat" if os.name == "nt" else "apksigner"
+    for sdk in candidates:
+        bt_root = sdk / "build-tools"
+        if not bt_root.is_dir():
+            continue
+
+        def version_key(p):
+            return [int(x) if x.isdigit() else 0 for x in p.name.replace("-", ".").split(".")]
+
+        for bt in sorted(bt_root.iterdir(), key=version_key, reverse=True):
+            za, sg = bt / f"zipalign{exe}", bt / signer
+            if za.is_file() and sg.is_file():
+                return za, sg
+    fail("Android SDK build-tools (zipalign/apksigner) not found. "
+         "Install them with Android Studio's SDK Manager or set ANDROID_HOME.")
+
+
+def find_keytool():
+    exe = "keytool.exe" if os.name == "nt" else "keytool"
+    if os.environ.get("JAVA_HOME"):
+        kt = Path(os.environ["JAVA_HOME"]) / "bin" / exe
+        if kt.is_file():
+            return str(kt)
+    kt = shutil.which("keytool")
+    if kt:
+        return kt
+    # Common install locations (JDKs, Android Studio's bundled JBR)
+    roots = []
+    if os.name == "nt":
+        for pf in (os.environ.get("ProgramFiles"), os.environ.get("ProgramFiles(x86)")):
+            if pf:
+                roots += [Path(pf) / "Java", Path(pf) / "Eclipse Adoptium",
+                          Path(pf) / "Microsoft", Path(pf) / "Android" / "Android Studio"]
+    else:
+        roots += [Path("/usr/lib/jvm"), Path("/Library/Java/JavaVirtualMachines"),
+                  Path("/Applications/Android Studio.app/Contents"), Path.home() / "android-studio"]
+    for root in roots:
+        if root.is_dir():
+            found = sorted(root.glob(f"**/bin/{exe}"), reverse=True)
+            if found:
+                return str(found[0])
+    fail("keytool not found. Install a Java JDK and/or set JAVA_HOME.")
+
+
+def run(cmd):
+    res = subprocess.run([str(c) for c in cmd], capture_output=True, text=True)
+    if res.returncode != 0:
+        fail(f"command failed: {Path(str(cmd[0])).name}\n{res.stdout}\n{res.stderr}")
+    return res
+
+
+def patch_dex(dex: bytearray):
+    sha = hashlib.sha256(dex).hexdigest()
+    if sha != SUPPORTED_DEX_SHA256:
+        fail("unsupported app version (classes.dex hash mismatch).\n"
+             "This patch only supports M RC PRO 25.10.31 (113).\n"
+             f"Got: {sha}")
+    for off, old, new in PATCHES:
+        if dex[off:off + len(old)] != old:
+            fail(f"unexpected bytes at 0x{off:x}")
+        dex[off:off + len(new)] = new
+    # Fix DEX header: SHA-1 of [32:] at offset 12, Adler-32 of [12:] at offset 8
+    dex[12:32] = hashlib.sha1(dex[32:]).digest()
+    struct.pack_into("<I", dex, 8, zlib.adler32(bytes(dex[12:])) & 0xFFFFFFFF)
+
+
+def rebuild_apk(src: Path, dst: Path):
+    with zipfile.ZipFile(src) as zin:
+        names = zin.namelist()
+        if "classes.dex" not in names:
+            fail("classes.dex not found - is this the right APK?")
+        dex = bytearray(zin.read("classes.dex"))
+        patch_dex(dex)
+        with zipfile.ZipFile(dst, "w") as zout:
+            for info in zin.infolist():
+                name = info.filename
+                # drop the original (now invalid) v1 signature
+                if name.startswith("META-INF/") and (
+                    name.endswith((".SF", ".RSA", ".DSA", ".EC")) or name == "META-INF/MANIFEST.MF"
+                ):
+                    continue
+                data = bytes(dex) if name == "classes.dex" else zin.read(name)
+                new = zipfile.ZipInfo(name, date_time=info.date_time)
+                new.compress_type = info.compress_type  # keep .so/resources.arsc STORED
+                new.external_attr = info.external_attr
+                zout.writestr(new, data)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Fix M RC PRO START button on Android 13+")
+    ap.add_argument("apk", type=Path, help="original M RC PRO APK (base.apk)")
+    ap.add_argument("-o", "--output", type=Path, default=Path("mrcpro-fixed.apk"))
+    ap.add_argument("--keystore", type=Path, default=Path("mrcpro-fix.keystore"),
+                    help="signing keystore (created if missing; keep it private)")
+    ap.add_argument("--ks-pass", default=DEFAULT_KS_PASS, help="keystore password")
+    args = ap.parse_args()
+
+    if not args.apk.is_file():
+        fail(f"file not found: {args.apk}")
+    zipalign, apksigner = find_build_tools()
+
+    if not args.keystore.is_file():
+        print(f"[*] Creating signing key: {args.keystore}")
+        run([find_keytool(), "-genkeypair", "-keystore", args.keystore, "-alias", KEY_ALIAS,
+             "-keyalg", "RSA", "-keysize", "2048", "-validity", "10000",
+             "-storepass", args.ks_pass, "-keypass", args.ks_pass, "-dname", "CN=M-RC-PRO-FIX"])
+
+    with tempfile.TemporaryDirectory() as tmp:
+        unsigned, aligned = Path(tmp) / "unsigned.apk", Path(tmp) / "aligned.apk"
+        print("[*] Patching classes.dex")
+        rebuild_apk(args.apk, unsigned)
+        print("[*] Aligning")
+        run([zipalign, "-f", "-p", "4", unsigned, aligned])
+        print("[*] Signing")
+        run([apksigner, "sign", "--ks", args.keystore, "--ks-pass", f"pass:{args.ks_pass}",
+             "--ks-key-alias", KEY_ALIAS, "--v4-signing-enabled", "false",
+             "--out", args.output, aligned])
+    run([apksigner, "verify", args.output])
+    print(f"[+] Done: {args.output}")
+    print("    Uninstall the original app, then install this APK "
+          "(e.g. 'adb install mrcpro-fixed.apk').")
+
+
+if __name__ == "__main__":
+    main()
